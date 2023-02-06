@@ -14,7 +14,7 @@ cl %FLAGS% %LIBS% ..\src\main.cpp || exit /b
 
 main.exe || exit /b
 
-traced.png
+cover.png
 
 popd
 

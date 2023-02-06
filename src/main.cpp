@@ -16,7 +16,7 @@
 typedef HMM_Vec3 vec3;
 
 /* random number stuff */
-/* TODO(lcf): replace this with lcf_random */
+/* TODO(lcf): replace crt stuff with lcf_random */
 
 #include <stdlib.h>
 inline float rf32() {
@@ -51,7 +51,7 @@ inline vec3 rvec3_hemisphere(const vec3 normal) {
 
 /* ***** */
 
-#define OUTPUT_IMAGE_PATH "traced.png"
+#define OUTPUT_IMAGE_PATH "cover.png"
 
 
 vec3 ReflectV3(const vec3 v, const vec3 n) {
@@ -66,12 +66,12 @@ vec3 RefractV3(const vec3 uv, const vec3 n, float refractive_ratio) {
     return r_T + r_II;
 }
 
-struct ray {
+struct Ray {
     vec3 pos;
     vec3 dir;
 };
 
-struct material {
+struct Material {
     enum {
         DIFFUSE = FLAG(0),
         METAL = FLAG(1),
@@ -83,31 +83,31 @@ struct material {
     float refraction;
 };
 
-struct hit {
-    ray normal;
+struct Hit {
+    Ray normal;
     u32 mat_id;
     f32 t;
     b32 front_face;
 };
 
-struct sphere {
+struct Sphere {
     vec3 pos;
     f32 radius;
     u32 mat_id;
 };
 
-struct scene {
-    sphere *object;
+struct Scene {
+    Sphere *object;
     u32 objects;
-    material *material;
+    Material *material;
     u32 materials;
 };
 
 b32 material_scatter
-(const material mat, const ray r, const hit h, ray *scattered, vec3 *attenuation) {
+(const Material mat, const Ray r, const Hit h, Ray *scattered, vec3 *attenuation) {
     b32 out = false;
     
-    if (TEST_FLAG(mat.flags, material::DIFFUSE)) {
+    if (TEST_FLAG(mat.flags, Material::DIFFUSE)) {
         scattered->pos = h.normal.pos;
         scattered->dir = rvec3_hemisphere(h.normal.dir);
         /* WARN(lcf): chance of bug with below if rvec3_unit = -normal
@@ -118,14 +118,14 @@ b32 material_scatter
         out = true;
     }
 
-    if (TEST_FLAG(mat.flags, material::METAL)) {
+    if (TEST_FLAG(mat.flags, Material::METAL)) {
         vec3 reflect_dir = ReflectV3(HMM_NormV3(r.dir), h.normal.dir);
         *scattered = {h.normal.pos, reflect_dir + mat.fuzz*rvec3_unit()};
         *attenuation = mat.albedo;
         out = HMM_DotV3(scattered->dir, h.normal.dir) > 0.0f;
     }
 
-    if (TEST_FLAG(mat.flags, material::GLASS)) {
+    if (TEST_FLAG(mat.flags, Material::GLASS)) {
         f32 refraction_ratio = h.front_face? (1.0f / mat.refraction) : mat.refraction;
         vec3 unit = HMM_NormV3(r.dir);
 
@@ -156,7 +156,7 @@ b32 material_scatter
     return out;
 }
 
-b32 hit_sphere(const sphere s, const ray r, f32 tmin, f32 tmax, hit *h) {
+b32 hit_sphere(const Sphere s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
     b32 out = false;
     vec3 oc = r.pos - s.pos;
     f32 a = HMM_LenSqrV3(r.dir);
@@ -187,9 +187,9 @@ b32 hit_sphere(const sphere s, const ray r, f32 tmin, f32 tmax, hit *h) {
     return out;
 }
 
-b32 hit_scene(const scene s, const ray r, f32 tmin, f32 tmax, hit *h) {
+b32 hit_scene(const Scene s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
     b32 out = false;
-    hit temp;
+    Hit temp;
     f32 tclosest = f32_MAX;
 
     for (u32 i = 0; i < s.objects; i++) {
@@ -203,7 +203,7 @@ b32 hit_scene(const scene s, const ray r, f32 tmin, f32 tmax, hit *h) {
     return out;
 }
 
-vec3 ray_color(ray r, scene s, s32 call_depth) {
+vec3 ray_color(Ray r, Scene s, s32 call_depth) {
     const vec3 white = {1.0f, 1.0f, 1.0f};
     const vec3 blue = {0.5f, 0.7f, 1.0f};
     const vec3 red = {1.0f, 0.0f, 0.5f};
@@ -213,9 +213,9 @@ vec3 ray_color(ray r, scene s, s32 call_depth) {
         return black;
     }
 
-    hit h;
+    Hit h;
     if (hit_scene(s, r, 0.001f, f32_MAX, &h)) {
-        ray scatter;
+        Ray scatter;
         vec3 attenuation;
         if (material_scatter(s.material[h.mat_id], r, h, &scatter, &attenuation)) {
             return attenuation * ray_color(scatter, s, call_depth-1);
@@ -237,25 +237,27 @@ struct camera {
     f32 lens_radius;
 };
 
-ray camera_ray(camera c, f32 u, f32 v) {
+Ray camera_ray(camera c, f32 u, f32 v) {
     vec3 rd = c.lens_radius * rvec3_unit();
     vec3 offset = c.u * rd.X + c.v * rd.Y;
-    ray out;
+    Ray out;
     out.pos = c.pos + offset;
     out.dir = c.lower_left + u*c.horizontal + v*c.vertical - c.pos - offset;
     return out;
 }
 
 int main(int argc, char* argv[]) {
+    os_Init();
+    
     Arena *arena = Arena::create();
 
     const f32 aspect_ratio = 3.0f / 2.0f;
-    const s32 Width = 1200;
+    const s32 Width = 600;
     const s32 Height = static_cast<s32>(Width / aspect_ratio);
     const s32 Channels = 3; /* RGB */
-    const s32 SamplesPerPixel = 100;
+    const s32 SamplesPerPixel = 25;
     const s32 CallDepthPerPixel = 50;
-    const s32 OutputScale = 4;
+    const s32 OutputScale = 3;
     const s32 OutputWidth = OutputScale*Width;
     const s32 OutputHeight = OutputScale*Height;
         
@@ -265,40 +267,49 @@ int main(int argc, char* argv[]) {
 
     /* Build Scene */
     printf("building scene: \n");
-    scene Scene = {0};
+    Scene Scene = {0};
     {
-        Scene.object = arena->take_array<sphere>(512);
-        Scene.material = arena->take_array<material>(512);
+        Scene.object = arena->take_array<Sphere>(512);
+        Scene.material = arena->take_array<Material>(512);
 
         /* Ground */
-        Scene.material[Scene.materials++] = {material::DIFFUSE, {0.8f, 0.8f, 0.0f}, 1.0f};
+        Scene.material[Scene.materials++] = {Material::DIFFUSE, {0.5f, 0.5f, 0.5f}, 1.0f};
         Scene.object[Scene.objects++] = {{ 0.0f, -1000.0f, 0.0f}, 1000.0f, 0};
 
-        s32 sz = 3;
+        s32 sz = 11;
         for (s32 a = -sz; a < sz; a++) {
             for (s32 b = -sz; b < sz; b++) {
-                sphere spr = {};
+                Sphere spr = {};
                 f32 radius = 0.2f;
                 vec3 pos = {a + 0.9f * rf32(), radius, b + 0.9f * rf32()};
                 spr = {pos, radius, Scene.materials};
                 Scene.object[Scene.objects++] = spr;
                 
-                material mat = {};
+                Material mat = {};
                 f32 choose_mat = rf32();
                 if (choose_mat < 0.8f) { /* Diffuse */
-                    mat.flags = material::DIFFUSE;
+                    mat.flags = Material::DIFFUSE;
                     mat.albedo = rvec3()*rvec3();
                 } else if (choose_mat < 0.95f) { /* Metal */
-                    mat.flags = material::METAL;
+                    mat.flags = Material::METAL;
                     mat.albedo = rvec3_range(0.5f, 1.0f);
                     mat.fuzz = rf32_range(0.0f, 0.5f);
                 } else { /* Glass */
-                    mat.flags = material::GLASS;
+                    mat.flags = Material::GLASS;
                     mat.refraction = 1.5;
                 }
                 Scene.material[Scene.materials++] = mat;
             }
         }
+
+        Scene.object[Scene.objects++] = {{0.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.material[Scene.materials++] = {Material::GLASS, {}, 0.0f, 1.5f};
+
+        Scene.object[Scene.objects++] = {{-4.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.material[Scene.materials++] = {Material::DIFFUSE, {0.4f, 0.2f, 0.1f}, 0.f, 0.f};
+
+        Scene.object[Scene.objects++] = {{4.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.material[Scene.materials++] = {Material::METAL, {0.7f, 0.6f, 0.5f}, 0.f, 0.f};
     }
 
     /* Build Camera */
@@ -341,7 +352,7 @@ int main(int argc, char* argv[]) {
             for (s32 s = 0; s < SamplesPerPixel; ++s) {
                 f32 u = (i + rf32()) / (Width  - 1);
                 f32 v = (j + rf32()) / (Height - 1);
-                ray r = camera_ray(Camera, u, v);
+                Ray r = camera_ray(Camera, u, v);
                 pixel_color += scale*ray_color(r, Scene, CallDepthPerPixel);
             }
 
@@ -366,8 +377,8 @@ int main(int argc, char* argv[]) {
             *(write++) = static_cast<u8>(HMM_Clamp(0.0f, col.B, 1.0f)*u8_MAX);
         }
     }
-    stbi_write_png(OUTPUT_IMAGE_PATH, OutputWidth, OutputHeight, Channels,
-                   OutputBuffer, OutputWidth*Channels);
+    ASSERT(stbi_write_png(OUTPUT_IMAGE_PATH, OutputWidth, OutputHeight, Channels,
+                          OutputBuffer, OutputWidth*Channels) > 0);
     printf("done! >> " OUTPUT_IMAGE_PATH "\n");
-    printf("Rendered in %llu microseconds!\n", renderEndTime - renderStartTime);
+    printf("Rendered in %f seconds!\n", (renderEndTime - renderStartTime) / 1.0e6);
 }
