@@ -69,6 +69,7 @@ vec3 RefractV3(const vec3 uv, const vec3 n, float refractive_ratio) {
 struct Ray {
     vec3 pos;
     vec3 dir;
+    vec3 dir_inv;
 };
 
 struct Material {
@@ -85,22 +86,23 @@ struct Material {
 
 struct Hit {
     Ray normal;
-    u32 mat_id;
+    u32 mat_i;
     f32 t;
     b32 front_face;
 };
 
 struct AABB {
-    
+    vec3 min;
+    vec3 max;
 };
 
 /* TODO: could be a union.. but maybe better this way? */
 struct Obj {
     enum {
-        SPHERE = FLAG(1),
+        SPHERE = FLAG(0),
     };
     u32 flags;
-    u32 mat_id;
+    u32 mat_i;
     vec3 pos;
     /* Sphere */
     f32 radius;
@@ -109,11 +111,12 @@ struct Obj {
 struct BVNode {
     AABB bound;
     union {
-        u32 right_child_id; /* Either right child or primitives */
-        u32 first_object_id;
+        u32 right_child_i; 
+        u32 first_object_i;
     };
     u16 objects;
-    u8 axis;
+    u8 axis; /* WARN(lcf): I don't understand the reason why this is here in pbr.
+                what is this used for? */
     u8 __pad;
 };
 
@@ -179,8 +182,24 @@ b32 material_scatter
         *attenuation = {1.0f, 1.0f, 1.0f};
         out = true;
     }
-    
+
+    scattered->dir_inv = {
+        1.0f / scattered->dir.X,
+        1.0f / scattered->dir.Y,
+        1.0f / scattered->dir.Z
+    };
     return out;
+}
+
+b32 hit_aabb(const AABB bound, const Ray r, f32 tmin, f32 tmax) {
+    for (int dim = 0; dim < 3; dim++) {
+        f32 t0 = (bound.min.Elements[dim] - r.pos.Elements[dim]) * r.dir_inv.Elements[dim];
+        f32 t1 = (bound.max.Elements[dim] - r.pos.Elements[dim]) * r.dir_inv.Elements[dim];
+
+        tmin = MAX(tmin, MIN(t0, t1));
+        tmax = MIN(tmax, MAX(t0, t1));
+    }
+    return tmin < tmax;
 }
 
 b32 hit_sphere(const Obj s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
@@ -202,7 +221,7 @@ b32 hit_sphere(const Obj s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
             h->t = root;
             h->normal.pos = r.pos + root*r.dir;
             h->normal.dir = (h->normal.pos - s.pos) / s.radius;
-            h->mat_id = s.mat_id;
+            h->mat_i = s.mat_i;
 
             h->front_face = HMM_DotV3(r.dir, h->normal.dir) < 0;
             if (!h->front_face) {
@@ -222,8 +241,8 @@ b32 hit_scene(const Scene s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
        For this reason a stack of right children is necessary, since they may be
        a (somewhat) arbitrary offset away from the left child.
      */
-    Hit hitclosest;
-    hitclosest.t = f32_MAX:
+    Hit hitclosest = {};
+    hitclosest.t = f32_MAX;
 
     /* NOTE: Stack size can be fairly small assuming tree is balanced, meaning traversal depth
        is logarithmic. Scene has up to 2^32 objects (u32), so 64 stack-slots is sufficient. */
@@ -236,17 +255,17 @@ b32 hit_scene(const Scene s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
         c = stack[--stackc];
         bv = s.bvh[c];
 
-        if (hit_aabb(bv.bound, r, tmin, hitclosest.t, &hitclosest)) {
-            if (bv.primitives > 0) {
+        if (hit_aabb(bv.bound, r, tmin, hitclosest.t)) {
+            if (bv.objects > 0) {
                 for (s32 i = 0; i < bv.objects; i++) {
-                    Obj o = s.object[bv.first_object_id + i];
+                    Obj o = s.object[bv.first_object_i + i];
                     if (hit_sphere(o, r, tmin, hitclosest.t, &hitclosest)) {
                         out = true;
                         *h = hitclosest;
                     }
                 }
             } else {
-                stack[stackc++] = bv.right_child_id;
+                stack[stackc++] = bv.right_child_i;
                 stack[stackc++] = c + 1;
             }
         } 
@@ -284,7 +303,7 @@ vec3 ray_color(Ray r, Scene s, s32 call_depth) {
            the reflected ray would not escape the object essentially. 
         */
         /* TODO(lcf): similarly, consider inlining hit_scene */
-        if (!material_scatter(s.material[h.mat_id], r, h, &scatter, &new_attenuation)) {
+        if (!material_scatter(s.material[h.mat_i], r, h, &scatter, &new_attenuation)) {
             out = {0.0};
             break;
         }
@@ -311,6 +330,7 @@ Ray camera_ray(camera c, f32 u, f32 v) {
     Ray out;
     out.pos = c.pos + offset;
     out.dir = c.lower_left + u*c.horizontal + v*c.vertical - c.pos - offset;
+    out.dir_inv = {1.0f / out.dir.X, 1.0f / out.dir.Y, 1.0f / out.dir.Z};
     return out;
 }
 
@@ -337,20 +357,20 @@ int main(int argc, char* argv[]) {
     printf("building scene: \n");
     Scene Scene = {0};
     {
-        Scene.object = arena->take_array<Object>(512);
+        Scene.object = arena->take_array<Obj>(512);
         Scene.material = arena->take_array<Material>(512);
 
         /* Ground */
         Scene.material[Scene.materials++] = {Material::DIFFUSE, {0.5f, 0.5f, 0.5f}, 1.0f};
-        Scene.object[Scene.objects++] = {{ 0.0f, -1000.0f, 0.0f}, 1000.0f, 0};
+        Scene.object[Scene.objects++] = {Obj::SPHERE, 0, { 0.0f, -1000.0f, 0.0f}, 1000.0f};
 
         s32 sz = 0;
         for (s32 a = -sz; a < sz; a++) {
             for (s32 b = -sz; b < sz; b++) {
-                Object spr = {};
+                Obj spr = {};
                 f32 radius = 0.2f;
                 vec3 pos = {a + 0.9f * rf32(), radius, b + 0.9f * rf32()};
-                spr = {pos, radius, Scene.materials};
+                spr = {Obj::SPHERE, Scene.materials, pos, radius};
                 Scene.object[Scene.objects++] = spr;
                 
                 Material mat = {};
@@ -370,13 +390,16 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        Scene.object[Scene.objects++] = {{0.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.object[Scene.objects++] = {Obj::SPHERE, Scene.materials,
+                                         {0.0f, 1.0f, 0.0f}, 1.0f};
         Scene.material[Scene.materials++] = {Material::GLASS, {}, 0.0f, 1.5f};
 
-        Scene.object[Scene.objects++] = {{-4.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.object[Scene.objects++] = {Obj::SPHERE, Scene.materials,
+                                         {-4.0f, 1.0f, 0.0f}, 1.0f};
         Scene.material[Scene.materials++] = {Material::DIFFUSE, {0.4f, 0.2f, 0.1f}, 0.f, 0.f};
 
-        Scene.object[Scene.objects++] = {{4.0f, 1.0f, 0.0f}, 1.0f, Scene.materials};
+        Scene.object[Scene.objects++] = {Obj::SPHERE, Scene.materials,
+                                         {4.0f, 1.0f, 0.0f}, 1.0f};
         Scene.material[Scene.materials++] = {Material::METAL, {0.7f, 0.6f, 0.5f}, 0.f, 0.f};
     }
 
