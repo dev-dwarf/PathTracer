@@ -90,14 +90,37 @@ struct Hit {
     b32 front_face;
 };
 
-struct Sphere {
-    vec3 pos;
-    f32 radius;
+struct AABB {
+    
+};
+
+/* TODO: could be a union.. but maybe better this way? */
+struct Obj {
+    enum {
+        SPHERE = FLAG(1),
+    };
+    u32 flags;
     u32 mat_id;
+    vec3 pos;
+    /* Sphere */
+    f32 radius;
+};
+
+struct BVNode {
+    AABB bound;
+    union {
+        u32 right_child_id; /* Either right child or primitives */
+        u32 first_object_id;
+    };
+    u16 objects;
+    u8 axis;
+    u8 __pad;
 };
 
 struct Scene {
-    Sphere *object;
+    BVNode *bvh;
+    u32 bvs;
+    Obj *object;
     u32 objects;
     Material *material;
     u32 materials;
@@ -106,6 +129,7 @@ struct Scene {
 b32 material_scatter
 (const Material mat, const Ray r, const Hit h, Ray *scattered, vec3 *attenuation) {
     b32 out = false;
+    /* TODO(lcf): refactor materials code to favor composition */
     
     if (TEST_FLAG(mat.flags, Material::DIFFUSE)) {
         scattered->pos = h.normal.pos;
@@ -122,6 +146,9 @@ b32 material_scatter
         vec3 reflect_dir = ReflectV3(HMM_NormV3(r.dir), h.normal.dir);
         *scattered = {h.normal.pos, reflect_dir + mat.fuzz*rvec3_unit()};
         *attenuation = mat.albedo;
+        /* NOTE(lcf): this conditional says that if the scattered ray would travel into
+           the surface again, cancel it's processing. This seems to be a form of
+           absorbtion? */
         out = HMM_DotV3(scattered->dir, h.normal.dir) > 0.0f;
     }
 
@@ -156,7 +183,7 @@ b32 material_scatter
     return out;
 }
 
-b32 hit_sphere(const Sphere s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
+b32 hit_sphere(const Obj s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
     b32 out = false;
     vec3 oc = r.pos - s.pos;
     f32 a = HMM_LenSqrV3(r.dir);
@@ -189,43 +216,84 @@ b32 hit_sphere(const Sphere s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
 
 b32 hit_scene(const Scene s, const Ray r, f32 tmin, f32 tmax, Hit *h) {
     b32 out = false;
-    Hit temp;
-    f32 tclosest = f32_MAX;
+    
+    /* Walk BVH Tree */
+    /* Tree is stored as an array, with left children of i at i + 1
+       For this reason a stack of right children is necessary, since they may be
+       a (somewhat) arbitrary offset away from the left child.
+     */
+    Hit hitclosest;
+    hitclosest.t = f32_MAX:
 
-    for (u32 i = 0; i < s.objects; i++) {
-        if (hit_sphere(s.object[i], r, tmin, tclosest, &temp)) {
-            out = true;
-            tclosest = temp.t;
-            *h = temp;
-        }
+    /* NOTE: Stack size can be fairly small assuming tree is balanced, meaning traversal depth
+       is logarithmic. Scene has up to 2^32 objects (u32), so 64 stack-slots is sufficient. */
+    u32 stack[64]; u32 stackc = 0;
+
+    u32 c = 0;
+    BVNode bv;
+    stack[stackc++] = c; /* push first BVNode on stack */
+    for (; stackc > 0; ) {
+        c = stack[--stackc];
+        bv = s.bvh[c];
+
+        if (hit_aabb(bv.bound, r, tmin, hitclosest.t, &hitclosest)) {
+            if (bv.primitives > 0) {
+                for (s32 i = 0; i < bv.objects; i++) {
+                    Obj o = s.object[bv.first_object_id + i];
+                    if (hit_sphere(o, r, tmin, hitclosest.t, &hitclosest)) {
+                        out = true;
+                        *h = hitclosest;
+                    }
+                }
+            } else {
+                stack[stackc++] = bv.right_child_id;
+                stack[stackc++] = c + 1;
+            }
+        } 
     }
 
     return out;
 }
 
+/* TODO: consider restructuring iterations such that each pixel is iterated at each step,
+   before taking more steps per pixel. This would allow previewing / early exiting from
+   render. */
 vec3 ray_color(Ray r, Scene s, s32 call_depth) {
     const vec3 white = {1.0f, 1.0f, 1.0f};
     const vec3 blue = {0.5f, 0.7f, 1.0f};
     const vec3 red = {1.0f, 0.0f, 0.5f};
     const vec3 black = {0.0f, 0.0f, 0.0f};
+
+    vec3 out = {0.0f};
     
-    if (call_depth <= 0) {
-        return black;
-    }
-
     Hit h;
-    if (hit_scene(s, r, 0.001f, f32_MAX, &h)) {
-        Ray scatter;
-        vec3 attenuation;
-        if (material_scatter(s.material[h.mat_id], r, h, &scatter, &attenuation)) {
-            return attenuation * ray_color(scatter, s, call_depth-1);
+    vec3 attenuation = {1.0f, 1.0f, 1.0f};
+    Ray scatter;
+    vec3 new_attenuation;
+    for (s32 i = 0; i < call_depth; i++) {
+        if (!hit_scene(s, r, 0.001f, f32_MAX, &h)) {
+            vec3 unit_dir = HMM_NormV3(r.dir);
+            f32 t = 0.5*(unit_dir.Y + 1.0); /* map [-1, 1] to [0, 1]; */
+            out = attenuation * HMM_LerpV3(white, t, blue);
+            break;
         }
-        return black;
+
+        /* TODO(lcf): consider removing material_scatter abstraction and    
+               directly controlling more. Can also directly accumulate attenuation.
+           NOTE: that material scatter is only false for METAL materials atm, and only when
+           the reflected ray would not escape the object essentially. 
+        */
+        /* TODO(lcf): similarly, consider inlining hit_scene */
+        if (!material_scatter(s.material[h.mat_id], r, h, &scatter, &new_attenuation)) {
+            out = {0.0};
+            break;
+        }
+        
+        attenuation *= new_attenuation;
+        r = scatter;
     }
 
-    vec3 unit_dir = HMM_NormV3(r.dir);
-    f32 t = 0.5*(unit_dir.Y + 1.0); /* map [-1, 1] to [0, 1]; */
-    return HMM_LerpV3(white, t, blue);
+    return out;
 }
 
 struct camera {
@@ -255,7 +323,7 @@ int main(int argc, char* argv[]) {
     const s32 Width = 600;
     const s32 Height = static_cast<s32>(Width / aspect_ratio);
     const s32 Channels = 3; /* RGB */
-    const s32 SamplesPerPixel = 25;
+    const s32 SamplesPerPixel = 10;
     const s32 CallDepthPerPixel = 50;
     const s32 OutputScale = 3;
     const s32 OutputWidth = OutputScale*Width;
@@ -269,17 +337,17 @@ int main(int argc, char* argv[]) {
     printf("building scene: \n");
     Scene Scene = {0};
     {
-        Scene.object = arena->take_array<Sphere>(512);
+        Scene.object = arena->take_array<Object>(512);
         Scene.material = arena->take_array<Material>(512);
 
         /* Ground */
         Scene.material[Scene.materials++] = {Material::DIFFUSE, {0.5f, 0.5f, 0.5f}, 1.0f};
         Scene.object[Scene.objects++] = {{ 0.0f, -1000.0f, 0.0f}, 1000.0f, 0};
 
-        s32 sz = 11;
+        s32 sz = 0;
         for (s32 a = -sz; a < sz; a++) {
             for (s32 b = -sz; b < sz; b++) {
-                Sphere spr = {};
+                Object spr = {};
                 f32 radius = 0.2f;
                 vec3 pos = {a + 0.9f * rf32(), radius, b + 0.9f * rf32()};
                 spr = {pos, radius, Scene.materials};
